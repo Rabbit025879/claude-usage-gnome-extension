@@ -1,0 +1,7 @@
+{
+  "uuid": "claude-usage@local",
+  "name": "Claude Usage",
+  "description": "Shows Claude Code's 5-hour and weekly usage limits in the top bar.",
+  "shell-version": ["46"],
+  "url": ""
+}
