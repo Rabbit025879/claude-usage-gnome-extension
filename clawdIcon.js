@@ -4,6 +4,8 @@ import GObject from 'gi://GObject';
 import St from 'gi://St';
 import cairo from 'gi://cairo';
 
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
 const FRAME_COUNT = 12;
 const FRAME_SIZE = 64; // clawd-assets/frames/<mood>/<size>/ — matches ICON_SIZE at 2x for HiDPI crispness
 const ICON_SIZE = 50;
@@ -51,25 +53,44 @@ class ClawdIcon extends St.DrawingArea {
         });
         this.set_size(ICON_SIZE, ICON_SIZE);
 
-        // Pre-load surfaces for every mood
+        // Frames are decoded lazily per mood on first use (see _framesFor),
+        // since most sessions never reach every mood.
+        this._extensionPath = extensionPath;
         this._surfaces = {};
-        for (const mood of MOODS)
-            this._surfaces[mood] = this._loadFrames(extensionPath, mood);
 
         this._mood = MOOD_IDLE;
         this._frameIndex = 0;
         this._timeoutId = null;
         this._currentInterval = null;
+        this._suspended = false;
 
         this.connect('repaint', area => this._onRepaint(area));
+
+        // Pause the animation while the screen is locked so it isn't
+        // ticking away CPU/battery for a display nobody can see.
+        try {
+            this._lockedChangedId = Main.screenShield.connect('locked-changed', () => {
+                this._setSuspended(!!Main.screenShield.locked);
+            });
+        } catch (e) {
+            logError(e, 'claude-usage: could not hook screen lock state');
+        }
 
         // Ensure proper cleanup on destroy to avoid memory leaks
         this.connect('destroy', () => {
             this._stopTimer();
             this._cleanupSurfaces();
+            if (this._lockedChangedId)
+                Main.screenShield.disconnect(this._lockedChangedId);
         });
 
         // Boots frozen on the idle pose (no running timer) until real usage data arrives.
+    }
+
+    _framesFor(mood) {
+        if (!this._surfaces[mood])
+            this._surfaces[mood] = this._loadFrames(this._extensionPath, mood);
+        return this._surfaces[mood];
     }
 
     _loadFrames(extensionPath, mood) {
@@ -78,7 +99,15 @@ class ClawdIcon extends St.DrawingArea {
             const n = i.toString().padStart(2, '0');
             const path = GLib.build_filenamev(
                 [extensionPath, 'clawd-assets', 'frames', mood, `${FRAME_SIZE}`, `clawd-${n}.png`]);
-            surfaces.push(cairo.ImageSurface.createFromPNG(path));
+            try {
+                const surface = cairo.ImageSurface.createFromPNG(path);
+                // A failed decode still yields a surface object, just a
+                // dimensionless one; _onRepaint already skips a null frame.
+                surfaces.push(surface.getWidth() > 0 && surface.getHeight() > 0 ? surface : null);
+            } catch (e) {
+                logError(e, `claude-usage: failed to load ${path}`);
+                surfaces.push(null);
+            }
         }
         return surfaces;
     }
@@ -114,13 +143,8 @@ class ClawdIcon extends St.DrawingArea {
     _startTimer(interval) {
         if (this._currentInterval === interval)
             return;
-        this._stopTimer();
         this._currentInterval = interval;
-        this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, interval, () => {
-            this._frameIndex = (this._frameIndex + 1) % FRAME_COUNT;
-            this.queue_repaint();
-            return GLib.SOURCE_CONTINUE;
-        });
+        this._restartTimer();
     }
 
     _stopTimer() {
@@ -128,6 +152,26 @@ class ClawdIcon extends St.DrawingArea {
             GLib.source_remove(this._timeoutId);
             this._timeoutId = null;
         }
+    }
+
+    // Suspends or resumes ticking without touching mood/frame/interval state,
+    // so the animation picks up exactly where it left off once resumed.
+    _setSuspended(suspended) {
+        if (this._suspended === suspended)
+            return;
+        this._suspended = suspended;
+        this._restartTimer();
+    }
+
+    _restartTimer() {
+        this._stopTimer();
+        if (this._suspended || this._currentInterval === null)
+            return;
+        this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, this._currentInterval, () => {
+            this._frameIndex = (this._frameIndex + 1) % FRAME_COUNT;
+            this.queue_repaint();
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     _cleanupSurfaces() {
@@ -146,7 +190,7 @@ class ClawdIcon extends St.DrawingArea {
     _onRepaint(area) {
         const cr = area.get_context();
         const [surfaceWidth, surfaceHeight] = area.get_surface_size();
-        const image = this._surfaces[this._mood]?.[this._frameIndex];
+        const image = this._framesFor(this._mood)[this._frameIndex];
 
         if (!image) {
             cr.$dispose();

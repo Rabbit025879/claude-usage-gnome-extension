@@ -29,6 +29,18 @@ const COLOR_NORMAL = 'color: #98c379;'; // Green
 const COLOR_WARNING = 'color: #e5c07b;'; // Yellow
 const COLOR_CRITICAL = 'color: #e06c75;'; // Red
 
+const STYLE_MONOSPACE = 'font-family: monospace;';
+
+// Promisify the file I/O used for credentials so reads/writes don't block
+// the compositor. Guarded because GJS throws if a method is promisified
+// twice, which would otherwise happen on a second enable() of this extension.
+try {
+    Gio._promisify(Gio.File.prototype, 'load_contents_async', 'load_contents_finish');
+    Gio._promisify(Gio.File.prototype, 'replace_contents_async', 'replace_contents_finish');
+} catch (e) {
+    // Already promisified by a previous enable() of this extension.
+}
+
 function colorForUtilization(percent) {
     if (percent >= 90)
         return COLOR_CRITICAL;
@@ -40,7 +52,7 @@ function colorForUtilization(percent) {
 // Generates a subtle, tech-style progress bar
 function makeProgressBar(percent) {
     const totalBlocks = 10;
-    const filledBlocks = Math.round((percent / 100) * totalBlocks);
+    const filledBlocks = Math.min(totalBlocks, Math.max(0, Math.round((percent / 100) * totalBlocks)));
     const emptyBlocks = totalBlocks - filledBlocks;
     return `[${'█'.repeat(filledBlocks)}${'░'.repeat(emptyBlocks)}]`;
 }
@@ -80,13 +92,22 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         // Some Anthropic hosts sit behind bot-detection that 403s requests
         // with no User-Agent at all; identify ourselves honestly.
         this._httpSession.user_agent = 'gnome-shell-extension-claude-usage/1.0';
+        this._cancellable = new Gio.Cancellable();
         this._timeoutId = null;
         this._fetchInFlight = false;
-        
+
         // Active state of the clawd animation (defaulting to enabled)
         this._animationEnabled = true;
+        this._hasUsageData = false;
         this._lastFiveHourPercent = 0;
         this._lastWeeklyPercent = 0;
+
+        // Cancel any in-flight requests so their callbacks never touch
+        // actors that are about to be disposed.
+        this.connect('destroy', () => {
+            this.stop();
+            this._cancellable.cancel();
+        });
 
         const box = new St.BoxLayout({y_align: Clutter.ActorAlign.CENTER});
 
@@ -126,41 +147,10 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         headerItem.actor.set_style('font-weight: bold; font-size: 0.85em; opacity: 0.6; padding-bottom: 4px;');
         this.menu.addMenuItem(headerItem);
 
-        // Build a highly customizable 5-Hour item with a layout box inside
-        this._fiveHourItem = new PopupMenu.PopupMenuItem('', {reactive: false});
-        this._fiveHourLayout = new St.BoxLayout({y_align: Clutter.ActorAlign.CENTER});
-        this._fiveHourLayout.set_style('font-family: monospace;');
-        
-        this._fhTitle = new St.Label({text: '5-Hour: ', y_align: Clutter.ActorAlign.CENTER});
-        this._fhBar = new St.Label({y_align: Clutter.ActorAlign.CENTER});
-        this._fhStats = new St.Label({y_align: Clutter.ActorAlign.CENTER});
-        
-        this._fiveHourLayout.add_child(this._fhTitle);
-        this._fiveHourLayout.add_child(this._fhBar);
-        this._fiveHourLayout.add_child(this._fhStats);
-        
-        // Remove the default label and insert our custom container instead
-        this._fiveHourItem.label.destroy();
-        this._fiveHourItem.add_child(this._fiveHourLayout);
-        this.menu.addMenuItem(this._fiveHourItem);
-
-        // Build a highly customizable Weekly item with a layout box inside
-        this._weeklyItem = new PopupMenu.PopupMenuItem('', {reactive: false});
-        this._weeklyLayout = new St.BoxLayout({y_align: Clutter.ActorAlign.CENTER});
-        this._weeklyLayout.set_style('font-family: monospace;');
-        
-        this._wkTitle = new St.Label({text: 'Weekly: ', y_align: Clutter.ActorAlign.CENTER});
-        this._wkBar = new St.Label({y_align: Clutter.ActorAlign.CENTER});
-        this._wkStats = new St.Label({y_align: Clutter.ActorAlign.CENTER});
-        
-        this._weeklyLayout.add_child(this._wkTitle);
-        this._weeklyLayout.add_child(this._wkBar);
-        this._weeklyLayout.add_child(this._wkStats);
-        
-        // Remove the default label and insert our custom container instead
-        this._weeklyItem.label.destroy();
-        this._weeklyItem.add_child(this._weeklyLayout);
-        this.menu.addMenuItem(this._weeklyItem);
+        // Highly customizable 5-Hour / Weekly menu rows, each with a
+        // title/bar/stats layout box inside instead of the default label.
+        this._fiveHourRow = this._buildUsageRow('5-Hour: ');
+        this._weeklyRow = this._buildUsageRow('Weekly: ');
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
@@ -183,16 +173,50 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         });
     }
 
-    _readCredentials() {
+    // Builds a menu row with a title/bar/stats layout in place of the
+    // default label, returning the widgets _updateUsageRow needs to fill in.
+    _buildUsageRow(titleText) {
+        const item = new PopupMenu.PopupMenuItem('', {reactive: false});
+        const layout = new St.BoxLayout({y_align: Clutter.ActorAlign.CENTER});
+        layout.set_style(STYLE_MONOSPACE);
+
+        const title = new St.Label({text: titleText, y_align: Clutter.ActorAlign.CENTER});
+        const bar = new St.Label({y_align: Clutter.ActorAlign.CENTER});
+        const stats = new St.Label({y_align: Clutter.ActorAlign.CENTER});
+
+        layout.add_child(title);
+        layout.add_child(bar);
+        layout.add_child(stats);
+
+        // Remove the default label and insert our custom container instead
+        item.label.destroy();
+        item.add_child(layout);
+        this.menu.addMenuItem(item);
+
+        return {bar, stats};
+    }
+
+    // Fills in a menu row's progress bar and stats text for the given
+    // percent/reset time, returning the tier color so callers can share it
+    // with the matching top-panel label.
+    _updateUsageRow(row, percent, resetIso) {
+        const color = colorForUtilization(percent);
+        row.bar.set_text(makeProgressBar(percent));
+        row.bar.set_style(color); // Only the progress bar is colored!
+        row.stats.set_text(` ${percent.toString().padStart(3, ' ')}% (${formatRelativeResetTime(resetIso)})`);
+        return color;
+    }
+
+    async _readCredentials() {
         try {
             const file = Gio.File.new_for_path(CREDENTIALS_PATH);
-            const [ok, contents] = file.load_contents(null);
-            if (!ok)
-                return null;
+            const [contents] = await file.load_contents_async(this._cancellable);
             const text = new TextDecoder('utf-8').decode(contents);
             const json = JSON.parse(text);
             return json?.claudeAiOauth ?? null;
         } catch (e) {
+            if (this._cancellable.is_cancelled())
+                return null;
             logError(e, 'claude-usage: failed to read credentials file');
             return null;
         }
@@ -200,14 +224,17 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
     // Writes the refreshed OAuth blob back to disk in the same shape the
     // `claude` CLI uses, keeping the file user-only readable.
-    _writeCredentials(oauth) {
+    async _writeCredentials(oauth) {
         try {
             const file = Gio.File.new_for_path(CREDENTIALS_PATH);
             const bytes = new TextEncoder().encode(JSON.stringify({claudeAiOauth: oauth}, null, 2));
-            file.replace_contents(bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, null);
+            await file.replace_contents_async(
+                bytes, null, false, Gio.FileCreateFlags.REPLACE_DESTINATION, this._cancellable);
             file.set_attribute_uint32('unix::mode', 0o600, Gio.FileQueryInfoFlags.NONE, null);
             return true;
         } catch (e) {
+            if (this._cancellable.is_cancelled())
+                return false;
             logError(e, 'claude-usage: failed to write credentials file');
             return false;
         }
@@ -222,7 +249,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             onComplete(null);
             return;
         }
-        if (oauth.refreshTokenExpiresAt && oauth.refreshTokenExpiresAt <= Date.now()) {
+        if (typeof oauth.refreshTokenExpiresAt === 'number' && oauth.refreshTokenExpiresAt <= Date.now()) {
             onComplete(null);
             return;
         }
@@ -246,7 +273,9 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
             }
             message.set_request_body_from_bytes('application/json', GLib.Bytes.new(requestBody));
 
-            this._httpSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session, result) => {
+            this._httpSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, this._cancellable, async (session, result) => {
+                if (this._cancellable.is_cancelled())
+                    return;
                 try {
                     // status_code avoids get_status()'s GEnum marshaling, which throws
                     // on codes Soup.Status doesn't define (e.g. 429 Too Many Requests).
@@ -273,12 +302,14 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                     if (typeof data.scope === 'string')
                         newOauth.scopes = data.scope.split(' ');
 
-                    if (!this._writeCredentials(newOauth)) {
+                    if (!await this._writeCredentials(newOauth)) {
                         onComplete(null);
                         return;
                     }
                     onComplete(newOauth.accessToken);
                 } catch (e) {
+                    if (this._cancellable.is_cancelled())
+                        return;
                     logError(e, `claude-usage: token refresh against ${TOKEN_URLS[urlIndex]} failed`);
                     tryUrl(urlIndex + 1);
                 }
@@ -286,6 +317,21 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         };
 
         tryUrl(0);
+    }
+
+    // Shared "refresh the token, then retry the usage fetch, or fall back"
+    // flow used both proactively (token looks expired) and reactively
+    // (a 401 came back for a token that looked fine). onNoToken is called
+    // when the refresh itself couldn't produce a usable token.
+    _refreshAndRetry(oauth, onNoToken) {
+        this._fetchInFlight = true;
+        this._refreshAccessToken(oauth, newToken => {
+            this._fetchInFlight = false;
+            if (newToken)
+                this._fetchUsageWithToken(newToken, false);
+            else
+                onNoToken();
+        });
     }
 
     // Handles fallback messages on system or request errors
@@ -297,31 +343,34 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._label7d.hide();
     }
 
-    _fetchUsage() {
+    // Async because reading credentials is now async; _fetchInFlight is set
+    // synchronously up front (before the first await) and only cleared on
+    // paths that don't hand off to another in-flight operation, so a second
+    // call arriving while credentials are being read is still rejected.
+    async _fetchUsage() {
         if (this._fetchInFlight)
             return;
+        this._fetchInFlight = true;
 
         if (!Gio.NetworkMonitor.get_default().get_network_available()) {
+            this._fetchInFlight = false;
             this._setSystemStatus('Claude: no connection', COLOR_WARNING);
             return;
         }
 
-        const oauth = this._readCredentials();
+        const oauth = await this._readCredentials();
         if (!oauth?.accessToken && !oauth?.refreshToken) {
+            this._fetchInFlight = false;
             this._setSystemStatus('Claude: no token');
             return;
         }
 
         const needsRefresh = !oauth.accessToken ||
-            (oauth.expiresAt && oauth.expiresAt <= Date.now() + TOKEN_REFRESH_BUFFER_SECONDS * 1000);
+            (typeof oauth.expiresAt === 'number' && oauth.expiresAt <= Date.now() + TOKEN_REFRESH_BUFFER_SECONDS * 1000);
 
         if (needsRefresh && oauth.refreshToken) {
-            this._fetchInFlight = true;
-            this._refreshAccessToken(oauth, newToken => {
-                this._fetchInFlight = false;
-                if (newToken)
-                    this._fetchUsageWithToken(newToken, false);
-                else if (oauth.accessToken)
+            this._refreshAndRetry(oauth, () => {
+                if (oauth.accessToken)
                     this._fetchUsageWithToken(oauth.accessToken, true); // try the stale token as a last resort
                 else
                     this._setSystemStatus('Claude: run `claude` to refresh', COLOR_WARNING);
@@ -330,6 +379,7 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         }
 
         if (!oauth.accessToken) {
+            this._fetchInFlight = false;
             this._setSystemStatus('Claude: run `claude` to refresh', COLOR_WARNING);
             return;
         }
@@ -350,26 +400,35 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         message.request_headers.append('anthropic-beta', 'oauth-2025-04-20');
 
         this._fetchInFlight = true;
-        this._httpSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, null, (session, result) => {
+        this._httpSession.send_and_read_async(message, GLib.PRIORITY_DEFAULT, this._cancellable, async (session, result) => {
             this._fetchInFlight = false;
+            if (this._cancellable.is_cancelled())
+                return;
             try {
                 // status_code avoids get_status()'s GEnum marshaling, which throws
                 // on codes Soup.Status doesn't define (e.g. 429 Too Many Requests).
                 const status = message.status_code;
                 if (status === 401) {
                     if (allowRefreshRetry) {
-                        const oauth = this._readCredentials();
+                        // Set back to true before the read below so a second
+                        // fetch can't slip in through the now-async read.
                         this._fetchInFlight = true;
-                        this._refreshAccessToken(oauth, newToken => {
-                            this._fetchInFlight = false;
-                            if (newToken)
-                                this._fetchUsageWithToken(newToken, false);
-                            else
-                                this._setSystemStatus('Claude: run `claude` to refresh', COLOR_WARNING);
-                        });
+                        const oauth = await this._readCredentials();
+                        this._refreshAndRetry(oauth, () => this._setSystemStatus('Claude: run `claude` to refresh', COLOR_WARNING));
                         return;
                     }
                     this._setSystemStatus('Claude: run `claude` to refresh', COLOR_WARNING);
+                    return;
+                }
+                if (status === Soup.Status.NONE) {
+                    // No real HTTP response was received (DNS/connect/TLS failure) —
+                    // not a server status. NetworkMonitor can lag actual connectivity
+                    // right after reconnecting, so re-check rather than trust the
+                    // upfront check at the top of _fetchUsage.
+                    if (!Gio.NetworkMonitor.get_default().get_network_available())
+                        this._setSystemStatus('Claude: no connection', COLOR_WARNING);
+                    else
+                        this._setSystemStatus('Claude: error', COLOR_WARNING);
                     return;
                 }
                 if (status !== Soup.Status.OK) {
@@ -382,6 +441,8 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
                 const data = JSON.parse(text);
                 this._render(data);
             } catch (e) {
+                if (this._cancellable.is_cancelled())
+                    return;
                 logError(e, 'claude-usage: fetch failed');
                 if (!Gio.NetworkMonitor.get_default().get_network_available())
                     this._setSystemStatus('Claude: no connection', COLOR_WARNING);
@@ -394,8 +455,11 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     _updateClawdAnimation() {
         if (this._animationEnabled) {
             // Restore mood/speed based on last saved usage (playing at 0% 5h,
-            // sleeping at 100% either window, otherwise idle tiered by usage)
-            this._clawd.setUsage(this._lastFiveHourPercent, this._lastWeeklyPercent);
+            // sleeping at 100% either window, otherwise idle tiered by usage).
+            // Before the first fetch resolves there's no real usage to show yet,
+            // so leave clawd on its frozen boot pose rather than faking 0%.
+            if (this._hasUsageData)
+                this._clawd.setUsage(this._lastFiveHourPercent, this._lastWeeklyPercent);
         } else {
             this._clawd.pause();
         }
@@ -411,39 +475,20 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         this._divider.show();
         this._label7d.show();
 
-        // Update top panel labels (no style/color for panel text fallback, or keep subtle colored highlights)
         this._label5h.set_text(`5h ${fh}%`);
-        this._label5h.set_style(colorForUtilization(fh));
-
         this._label7d.set_text(`7d ${wk}%`);
-        this._label7d.set_style(colorForUtilization(wk));
 
         // Save current utilization percentages
+        this._hasUsageData = true;
         this._lastFiveHourPercent = fh;
         this._lastWeeklyPercent = wk;
 
         // Render clawd based on toggle state
         this._updateClawdAnimation();
 
-        // Update custom styled menu items
-        const pb5h = makeProgressBar(fh);
-        const pb7d = makeProgressBar(wk);
-        
-        const reset5h = formatRelativeResetTime(fiveHour.resets_at);
-        const reset7d = formatRelativeResetTime(weekly.resets_at);
-
-        const color5h = colorForUtilization(fh);
-        const color7d = colorForUtilization(wk);
-
-        // 5-Hour dynamic updates
-        this._fhBar.set_text(pb5h);
-        this._fhBar.set_style(color5h); // Only the progress bar is colored!
-        this._fhStats.set_text(` ${fh.toString().padStart(3, ' ')}% (${reset5h})`);
-
-        // Weekly dynamic updates
-        this._wkBar.set_text(pb7d);
-        this._wkBar.set_style(color7d); // Only the progress bar is colored!
-        this._wkStats.set_text(` ${wk.toString().padStart(3, ' ')}% (${reset7d})`);
+        // Update the panel label and matching menu row together for each metric
+        this._label5h.set_style(this._updateUsageRow(this._fiveHourRow, fh, fiveHour.resets_at));
+        this._label7d.set_style(this._updateUsageRow(this._weeklyRow, wk, weekly.resets_at));
     }
 
     stop() {
