@@ -32,13 +32,13 @@ reacts to how close you are to your limits.
 
 There's no build step — GNOME loads the extension straight from source, so
 installing just means getting this repo's contents into GNOME's user
-extensions directory under the extension's UUID, `claude-usage@local`.
+extensions directory under the extension's UUID, `claude-usage@rabbit025879`.
 
 ### Option 1: clone directly into place
 
 ```sh
 git clone https://github.com/Rabbit025879/claude-usage-gnome-extension.git \
-  ~/.local/share/gnome-shell/extensions/claude-usage@local
+  ~/.local/share/gnome-shell/extensions/claude-usage@rabbit025879
 ```
 
 ### Option 2: clone elsewhere and symlink
@@ -48,19 +48,19 @@ other projects) and just link it into place:
 
 ```sh
 git clone https://github.com/Rabbit025879/claude-usage-gnome-extension.git ~/src/claude-usage-gnome-extension
-ln -s ~/src/claude-usage-gnome-extension ~/.local/share/gnome-shell/extensions/claude-usage@local
+ln -s ~/src/claude-usage-gnome-extension ~/.local/share/gnome-shell/extensions/claude-usage@rabbit025879
 ```
 
 ### Option 3: download without git
 
 Download and extract the [repo archive](https://github.com/Rabbit025879/claude-usage-gnome-extension/archive/refs/heads/main.zip)
-into `~/.local/share/gnome-shell/extensions/claude-usage@local/` (the folder
+into `~/.local/share/gnome-shell/extensions/claude-usage@rabbit025879/` (the folder
 must contain `metadata.json` directly, not a nested subfolder).
 
 ### Enable the extension
 
 ```sh
-gnome-extensions enable claude-usage@local
+gnome-extensions enable claude-usage@rabbit025879
 ```
 
 If that command reports the extension isn't found, GNOME Shell hasn't
@@ -84,7 +84,7 @@ If you installed via `git clone` (option 1 or 2), pull the latest changes
 and reload the shell:
 
 ```sh
-git -C ~/.local/share/gnome-shell/extensions/claude-usage@local pull
+git -C ~/.local/share/gnome-shell/extensions/claude-usage@rabbit025879 pull
 ```
 
 (Adjust the path if you used the symlink layout from option 2.)
@@ -92,8 +92,8 @@ git -C ~/.local/share/gnome-shell/extensions/claude-usage@local pull
 ### Uninstalling
 
 ```sh
-gnome-extensions disable claude-usage@local
-rm -rf ~/.local/share/gnome-shell/extensions/claude-usage@local
+gnome-extensions disable claude-usage@rabbit025879
+rm -rf ~/.local/share/gnome-shell/extensions/claude-usage@rabbit025879
 ```
 
 ## Usage

@@ -1,5 +1,5 @@
 {
-  "uuid": "claude-usage@local",
+  "uuid": "claude-usage@rabbit025879",
   "name": "Claude Usage",
   "description": "Shows Claude Code's 5-hour and weekly usage limits in the top bar.",
   "shell-version": ["46"],
