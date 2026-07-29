@@ -11,6 +11,14 @@ reacts to how close you are to your limits.
 - Dropdown menu with a progress bar, percentage, and relative reset time
   (`in 2h 14m`, `any moment now`, etc.) for each window.
 - Color-coded status: green under 75%, yellow from 75–89%, red at 90%+.
+- Weekly pacing hints: the weekly bar stamps a `|` marker showing where
+  cumulative usage should be if spent evenly over ~6 active days (leaving
+  the day before reset as slack), plus a line showing how many 5-hour
+  sessions realistically remain before reset (discounting ~10 hours/day for
+  sleep, meals, etc.) and roughly what % of the 5-hour limit each would need
+  to use to fully spend the remaining weekly quota instead of leaving it
+  unused. That per-session % is a rough estimate — Anthropic doesn't publish
+  the actual weekly-to-5-hour ratio.
 - Animated Clawd icon whose mood reflects usage — playful when 5-hour usage
   is at 0%, asleep when either window hits 100%, otherwise idling/trotting/
   sprinting based on how much you've used. Can be toggled off from the menu.

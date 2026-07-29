@@ -24,12 +24,35 @@ const POLL_INTERVAL_SECONDS = 300;
 // Refresh a little before actual expiry so a poll never races the clock.
 const TOKEN_REFRESH_BUFFER_SECONDS = 60;
 
+const FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
+const WEEKLY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+// Weekly pacing is spread over 6 days rather than 7, leaving the last day
+// before reset as slack — matches actual usage patterns better than a
+// straight 7-day split, since the day right before reset rarely gets used.
+const WEEKLY_BUDGET_DAYS = 6;
+// Hours per day treated as unavailable for usage (sleep, meals, etc.) when
+// estimating how many 5-hour windows are actually reachable before reset.
+const UNAVAILABLE_HOURS_PER_DAY = 10;
+// Rough, unverified estimate of how much of the weekly quota a single fully
+// maxed-out 5-hour window consumes (i.e. 100% of a 5-hour window ≈ 1/10th of
+// the weekly quota). Anthropic doesn't publish this ratio; it's a midpoint
+// guess from third-party estimates and may not hold for every account/model
+// mix — used only to translate the weekly budget into a 5-hour-scale number.
+const WEEKLY_TO_FIVE_HOUR_RATIO = 10;
+
 // Text styles for different utilization tiers
 const COLOR_NORMAL = 'color: #98c379;'; // Green
 const COLOR_WARNING = 'color: #e5c07b;'; // Yellow
 const COLOR_CRITICAL = 'color: #e06c75;'; // Red
 
 const STYLE_MONOSPACE = 'font-family: monospace;';
+// Smaller and dimmed so it reads as a secondary detail without widening the
+// menu much.
+const DETAIL_FONT_SCALE = 0.85;
+const STYLE_DETAIL = `font-family: monospace; opacity: 0.7; font-size: ${DETAIL_FONT_SCALE}em;`;
+// Leading spaces (scaled up since the detail line's font is smaller) so the
+// text lines up under the bar itself, not the "Weekly: " label before it.
+const DETAIL_INDENT = ' '.repeat(Math.ceil('Weekly: '.length / DETAIL_FONT_SCALE));
 
 // Promisify the file I/O used for credentials so reads/writes don't block
 // the compositor. Guarded because GJS throws if a method is promisified
@@ -49,12 +72,63 @@ function colorForUtilization(percent) {
     return COLOR_NORMAL;
 }
 
-// Generates a subtle, tech-style progress bar
-function makeProgressBar(percent) {
+// Generates a subtle, tech-style progress bar. When markerFraction is given,
+// a `|` is stamped at that position to show where cumulative usage should
+// be if pacing evenly, regardless of how much is actually filled in.
+function makeProgressBar(percent, markerFraction = null) {
     const totalBlocks = 10;
     const filledBlocks = Math.min(totalBlocks, Math.max(0, Math.round((percent / 100) * totalBlocks)));
-    const emptyBlocks = totalBlocks - filledBlocks;
-    return `[${'█'.repeat(filledBlocks)}${'░'.repeat(emptyBlocks)}]`;
+    const chars = Array.from({length: totalBlocks}, (_, i) => (i < filledBlocks ? '█' : '░'));
+    if (markerFraction !== null) {
+        const markerIndex = Math.min(totalBlocks - 1, Math.max(0, Math.round(markerFraction * totalBlocks)));
+        chars[markerIndex] = '|';
+    }
+    return `[${chars.join('')}]`;
+}
+
+// Fraction (0-1) of the 6-day pacing budget elapsed so far in the current
+// weekly window, derived from when it resets (the API doesn't expose window
+// start directly, so it's inferred as resets_at - 7 days).
+function weeklyDayTargetFraction(resetsIso) {
+    if (!resetsIso)
+        return null;
+    const resetsAt = new Date(resetsIso).getTime();
+    if (Number.isNaN(resetsAt))
+        return null;
+
+    const windowStart = resetsAt - WEEKLY_WINDOW_SECONDS * 1000;
+    const elapsedDays = (Date.now() - windowStart) / (24 * 60 * 60 * 1000);
+    return Math.max(0, Math.min(1, elapsedDays / WEEKLY_BUDGET_DAYS));
+}
+
+// How many 5-hour windows are realistically reachable before the weekly
+// reset (discounting unavailable hours per day), and how much of each
+// you'd need to use (on average) to fully spend the remaining weekly quota
+// by then instead of leaving it unused.
+function weeklySessionBudget(percent, resetsIso) {
+    if (!resetsIso)
+        return null;
+    const resetsAt = new Date(resetsIso).getTime();
+    if (Number.isNaN(resetsAt))
+        return null;
+
+    const secondsUntilReset = (resetsAt - Date.now()) / 1000;
+    if (secondsUntilReset <= 0)
+        return null;
+
+    const usableFraction = (24 - UNAVAILABLE_HOURS_PER_DAY) / 24;
+    const usableSecondsRemaining = secondsUntilReset * usableFraction;
+
+    const windowsRemaining = Math.max(1, Math.floor(usableSecondsRemaining / FIVE_HOUR_WINDOW_SECONDS));
+    const weeklyRemaining = Math.max(0, 100 - percent);
+    const budgetPerWindow = weeklyRemaining / windowsRemaining;
+    return {
+        windowsRemaining,
+        budgetPerWindow,
+        // Estimated equivalent as a % of the 5-hour limit — see
+        // WEEKLY_TO_FIVE_HOUR_RATIO for the caveat on accuracy.
+        estimatedFiveHourPercent: budgetPerWindow * WEEKLY_TO_FIVE_HOUR_RATIO,
+    };
 }
 
 // Converts absolute timestamps into clean, relative, readable format
@@ -174,9 +248,13 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
     }
 
     // Builds a menu row with a title/bar/stats layout in place of the
-    // default label, returning the widgets _updateUsageRow needs to fill in.
+    // default label, plus a smaller detail line underneath for overflow
+    // text that doesn't fit on the main row. Returns the widgets
+    // _updateUsageRow needs to fill in.
     _buildUsageRow(titleText) {
         const item = new PopupMenu.PopupMenuItem('', {reactive: false});
+        const container = new St.BoxLayout({vertical: true});
+
         const layout = new St.BoxLayout({y_align: Clutter.ActorAlign.CENTER});
         layout.set_style(STYLE_MONOSPACE);
 
@@ -187,23 +265,38 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
         layout.add_child(title);
         layout.add_child(bar);
         layout.add_child(stats);
+        container.add_child(layout);
+
+        const detail = new St.Label({text: ''});
+        detail.set_style(STYLE_DETAIL);
+        detail.hide();
+        container.add_child(detail);
 
         // Remove the default label and insert our custom container instead
         item.label.destroy();
-        item.add_child(layout);
+        item.add_child(container);
         this.menu.addMenuItem(item);
 
-        return {bar, stats};
+        return {bar, stats, detail};
     }
 
     // Fills in a menu row's progress bar and stats text for the given
     // percent/reset time, returning the tier color so callers can share it
-    // with the matching top-panel label.
-    _updateUsageRow(row, percent, resetIso) {
+    // with the matching top-panel label. markerFraction stamps a pacing
+    // target into the bar; extra, if given, fills the detail line below
+    // the row instead of crowding the main row, tinted by detailColor.
+    _updateUsageRow(row, percent, resetIso, {markerFraction = null, extra = '', detailColor = ''} = {}) {
         const color = colorForUtilization(percent);
-        row.bar.set_text(makeProgressBar(percent));
+        row.bar.set_text(makeProgressBar(percent, markerFraction));
         row.bar.set_style(color); // Only the progress bar is colored!
         row.stats.set_text(` ${percent.toString().padStart(3, ' ')}% (${formatRelativeResetTime(resetIso)})`);
+        if (extra) {
+            row.detail.set_text(extra);
+            row.detail.set_style(`${STYLE_DETAIL}${detailColor}`);
+            row.detail.show();
+        } else {
+            row.detail.hide();
+        }
         return color;
     }
 
@@ -488,7 +581,16 @@ class ClaudeUsageIndicator extends PanelMenu.Button {
 
         // Update the panel label and matching menu row together for each metric
         this._label5h.set_style(this._updateUsageRow(this._fiveHourRow, fh, fiveHour.resets_at));
-        this._label7d.set_style(this._updateUsageRow(this._weeklyRow, wk, weekly.resets_at));
+
+        const markerFraction = weeklyDayTargetFraction(weekly.resets_at);
+        const budget = weeklySessionBudget(wk, weekly.resets_at);
+        const fiveHourPctText = budget && budget.estimatedFiveHourPercent > 100
+            ? '100+' : budget?.estimatedFiveHourPercent.toFixed(0);
+        const extra = budget
+            ? `${DETAIL_INDENT}${budget.windowsRemaining} sessions left · ~${fiveHourPctText}%/session`
+            : '';
+        const detailColor = budget ? colorForUtilization(budget.estimatedFiveHourPercent) : '';
+        this._label7d.set_style(this._updateUsageRow(this._weeklyRow, wk, weekly.resets_at, {markerFraction, extra, detailColor}));
     }
 
     stop() {
