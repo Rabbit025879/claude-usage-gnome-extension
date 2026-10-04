@@ -86,10 +86,10 @@ function makeProgressBar(percent, markerFraction = null) {
     return `[${chars.join('')}]`;
 }
 
-// Fraction (0-1) of the 6-day pacing budget elapsed so far in the current
-// weekly window, or null once that budget has fully elapsed. Derived from
-// when it resets (the API doesn't expose window start directly, so it's
-// inferred as resets_at - 7 days).
+// Fraction (0-1) of the 6-day pacing budget that should be used by the end of
+// the current day of the weekly window, or null once that budget has elapsed.
+// Derived from when it resets (the API doesn't expose window start directly,
+// so it's inferred as resets_at - 7 days).
 function weeklyDayTargetFraction(resetsIso) {
     if (!resetsIso)
         return null;
@@ -103,7 +103,9 @@ function weeklyDayTargetFraction(resetsIso) {
     // bar, so drop it instead.
     if (elapsedDays >= WEEKLY_BUDGET_DAYS)
         return null;
-    return Math.max(0, elapsedDays / WEEKLY_BUDGET_DAYS);
+    // Step per day: during day N the target is the end-of-day-N share (N/6).
+    const dayNumber = Math.max(1, Math.ceil(elapsedDays));
+    return dayNumber / WEEKLY_BUDGET_DAYS;
 }
 
 // How many 5-hour windows are realistically reachable before the weekly
